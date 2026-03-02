@@ -1,0 +1,38 @@
+# Database
+db/
+*.db
+*.db-wal
+*.db-shm
+
+# Virtual environment
+venv/
+
+# Data files
+data/
+*.csv
+*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Logs
+*.log
+
+# Config with secrets
+config/settings.yaml
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
