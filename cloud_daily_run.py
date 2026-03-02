@@ -57,79 +57,85 @@ def is_trade_day(date: datetime = None) -> bool:
 
 
 # ===========================================================================
-# 2. 数据拉取 — akshare 全市场日线（按日期批量拉取，比逐只快 10 倍）
+# 2. 数据拉取 — BaoStock 批量拉取主板股票日线
 # ===========================================================================
 def fetch_all_stock_data(days: int = 150) -> tuple[dict, dict]:
-    """用 akshare 拉取所有主板股票近 N 天日线数据。
+    """用 baostock 拉取所有主板股票近 N 天日线数据。
 
-    策略：用 ak.stock_zh_a_hist() 逐只拉取前复权日线。
-    为加速，先用实时行情获取股票列表并预过滤 ST，再批量拉日线。
+    baostock 是国内学术数据源，海外 IP 可正常访问。
+    约 0.8s/只，3000 只约需 40 分钟，workflow timeout 设为 60 分钟。
 
     Returns:
         all_data: {code: DataFrame}
         names:    {code: name}
     """
-    import akshare as ak
+    import baostock as bs
 
-    # 获取全部A股实时行情（含代码、名称），用于过滤
-    log.info("获取A股列表...")
-    spot_df = ak.stock_zh_a_spot_em()
-    # 列: 代码, 名称, 最新价, ...
-    spot_df = spot_df[["代码", "名称"]].copy()
-    spot_df = spot_df.rename(columns={"代码": "code", "名称": "name"})
+    lg = bs.login()
+    if lg.error_code != "0":
+        raise RuntimeError(f"baostock login failed: {lg.error_msg}")
 
-    # 过滤主板（00/60开头），排除ST
-    spot_df = spot_df[spot_df["code"].str.match(r"^(00|60)\d{4}$")]
-    spot_df = spot_df[~spot_df["name"].str.contains("ST", case=False, na=False)]
-    names = dict(zip(spot_df["code"], spot_df["name"]))
-    codes = spot_df["code"].tolist()
-    log.info(f"主板非ST股票: {len(codes)} 只")
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
 
-    end_date = datetime.now().strftime("%Y%m%d")
-    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+    # 获取股票列表和名称
+    log.info("获取股票列表...")
+    rs_basic = bs.query_stock_basic()
+    basic_rows = []
+    while rs_basic.error_code == "0" and rs_basic.next():
+        basic_rows.append(rs_basic.get_row_data())
+    basic_df = pd.DataFrame(basic_rows, columns=rs_basic.fields)
 
-    # 逐只拉取日线（akshare stock_zh_a_hist 速度约 0.3s/只）
+    # 过滤：上市股票、主板（00/60开头）、排除ST
+    basic_df = basic_df[(basic_df["type"] == "1") & (basic_df["status"] == "1")]
+    basic_df["pure_code"] = basic_df["code"].str.split(".").str[1]
+    basic_df = basic_df[basic_df["pure_code"].str.match(r"^(00|60)\d{4}$")]
+    basic_df = basic_df[~basic_df["code_name"].str.contains("ST", case=False, na=False)]
+
+    names = dict(zip(basic_df["pure_code"], basic_df["code_name"]))
+    bs_codes = basic_df["code"].tolist()
+    log.info(f"待拉取股票: {len(bs_codes)} 只")
+
+    # 批量拉取日线
     all_data = {}
-    total = len(codes)
-    for i, code in enumerate(codes):
+    total = len(bs_codes)
+    for i, bs_code in enumerate(bs_codes):
         if (i + 1) % 500 == 0:
             log.info(f"  进度: {i+1}/{total}")
+
         try:
-            df = ak.stock_zh_a_hist(
-                symbol=code,
-                period="daily",
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                "date,open,high,low,close,volume,amount,turn",
                 start_date=start_date,
                 end_date=end_date,
-                adjust="qfq",  # 前复权
+                frequency="d",
+                adjustflag="2",  # 前复权
             )
         except Exception:
             continue
 
-        if df is None or len(df) < 120:
+        rows = []
+        while rs.error_code == "0" and rs.next():
+            rows.append(rs.get_row_data())
+
+        if len(rows) < 120:
             continue
 
-        # 统一列名
-        df = df.rename(columns={
-            "日期": "trade_date",
-            "开盘": "open",
-            "最高": "high",
-            "最低": "low",
-            "收盘": "close",
-            "成交量": "volume",
-            "成交额": "amount",
-        })
-        df = df[["trade_date", "open", "high", "low", "close", "volume", "amount"]]
+        df = pd.DataFrame(rows, columns=rs.fields)
+        df.rename(columns={"date": "trade_date"}, inplace=True)
         for col in ["open", "high", "low", "close", "volume", "amount"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-        df["trade_date"] = df["trade_date"].astype(str)
         df = df.dropna(subset=["close"])
         df = df[df["volume"] > 0]
 
         if len(df) < 120:
             continue
 
-        all_data[code] = df.reset_index(drop=True)
+        pure_code = bs_code.split(".")[1]
+        all_data[pure_code] = df.reset_index(drop=True)
 
+    bs.logout()
     log.info(f"成功加载 {len(all_data)} 只股票数据")
     return all_data, names
 
