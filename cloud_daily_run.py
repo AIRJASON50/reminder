@@ -67,6 +67,7 @@ def _fetch_batch(args):
 
     lg = bs.login()
     print(f"[Worker-{batch_id}] login: code={lg.error_code}, msg={lg.error_msg}", flush=True)
+    print(f"[Worker-{batch_id}] date range: {start_date} ~ {end_date}, stocks: {len(bs_codes)}", flush=True)
     if lg.error_code != "0":
         print(f"[Worker-{batch_id}] login FAILED, returning empty", flush=True)
         return {}
@@ -93,8 +94,10 @@ def _fetch_batch(args):
         while rs.error_code == "0" and rs.next():
             rows.append(rs.get_row_data())
 
-        if i < 3:
-            print(f"[Worker-{batch_id}] {bs_code}: {len(rows)} rows", flush=True)
+        if i < 2:
+            print(f"[Worker-{batch_id}] {bs_code}: {len(rows)} rows, rs_err={rs.error_code}, rs_msg={rs.error_msg}", flush=True)
+            if rows:
+                print(f"[Worker-{batch_id}] {bs_code} first_date={rows[0][0]}, last_date={rows[-1][0]}", flush=True)
 
         if len(rows) < 120:
             skipped += 1
