@@ -402,7 +402,7 @@ def run():
 
     # 拉取数据
     log.info("[1/3] 在线拉取股票数据...")
-    all_data, names = fetch_all_stock_data(days=150)
+    all_data, names = fetch_all_stock_data()
 
     # 选股
     log.info("[2/3] 执行选股筛选...")
