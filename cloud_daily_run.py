@@ -122,11 +122,11 @@ def _fetch_batch(args):
     return results
 
 
-def fetch_all_stock_data(days: int = 250) -> tuple[dict, dict]:
+def fetch_all_stock_data(days: int = 365) -> tuple[dict, dict]:
     """用 baostock 多进程并发拉取所有主板股票近 N 天日线数据。
 
-    需要 120 个交易日数据，250 日历日 ≈ 160 个交易日，留有余量。
-    开 4 个进程并发拉取，约 15-20 分钟完成。
+    需要 120 个交易日数据。A股每年约 242 个交易日，365 日历日 ≈ 242 交易日。
+    开 4 个进程并发拉取，约 20-30 分钟完成。
 
     Returns:
         all_data: {code: DataFrame}
