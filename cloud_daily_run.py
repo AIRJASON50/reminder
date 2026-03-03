@@ -64,10 +64,17 @@ def _fetch_batch(args):
     import baostock as bs
 
     bs_codes, start_date, end_date, batch_id = args
-    bs.login()
-    results = {}
 
-    for bs_code in bs_codes:
+    lg = bs.login()
+    print(f"[Worker-{batch_id}] login: code={lg.error_code}, msg={lg.error_msg}", flush=True)
+    if lg.error_code != "0":
+        print(f"[Worker-{batch_id}] login FAILED, returning empty", flush=True)
+        return {}
+
+    results = {}
+    skipped = 0
+
+    for i, bs_code in enumerate(bs_codes):
         try:
             rs = bs.query_history_k_data_plus(
                 bs_code,
@@ -77,14 +84,20 @@ def _fetch_batch(args):
                 frequency="d",
                 adjustflag="2",
             )
-        except Exception:
+        except Exception as e:
+            if i < 3:
+                print(f"[Worker-{batch_id}] {bs_code} exception: {e}", flush=True)
             continue
 
         rows = []
         while rs.error_code == "0" and rs.next():
             rows.append(rs.get_row_data())
 
+        if i < 3:
+            print(f"[Worker-{batch_id}] {bs_code}: {len(rows)} rows", flush=True)
+
         if len(rows) < 120:
+            skipped += 1
             continue
 
         df = pd.DataFrame(rows, columns=rs.fields)
@@ -95,12 +108,14 @@ def _fetch_batch(args):
         df = df[df["volume"] > 0]
 
         if len(df) < 120:
+            skipped += 1
             continue
 
         pure_code = bs_code.split(".")[1]
         results[pure_code] = df.reset_index(drop=True)
 
     bs.logout()
+    print(f"[Worker-{batch_id}] done: {len(results)} loaded, {skipped} skipped", flush=True)
     return results
 
 
