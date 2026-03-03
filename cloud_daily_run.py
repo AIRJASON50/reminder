@@ -57,19 +57,64 @@ def is_trade_day(date: datetime = None) -> bool:
 
 
 # ===========================================================================
-# 2. 数据拉取 — BaoStock 批量拉取主板股票日线
+# 2. 数据拉取 — BaoStock 多进程并发拉取主板股票日线
 # ===========================================================================
-def fetch_all_stock_data(days: int = 150) -> tuple[dict, dict]:
-    """用 baostock 拉取所有主板股票近 N 天日线数据。
+def _fetch_batch(args):
+    """子进程：独立登录 baostock，拉取一批股票数据。"""
+    import baostock as bs
 
-    baostock 是国内学术数据源，海外 IP 可正常访问。
-    约 0.8s/只，3000 只约需 40 分钟，workflow timeout 设为 60 分钟。
+    bs_codes, start_date, end_date, batch_id = args
+    bs.login()
+    results = {}
+
+    for bs_code in bs_codes:
+        try:
+            rs = bs.query_history_k_data_plus(
+                bs_code,
+                "date,open,high,low,close,volume,amount,turn",
+                start_date=start_date,
+                end_date=end_date,
+                frequency="d",
+                adjustflag="2",
+            )
+        except Exception:
+            continue
+
+        rows = []
+        while rs.error_code == "0" and rs.next():
+            rows.append(rs.get_row_data())
+
+        if len(rows) < 120:
+            continue
+
+        df = pd.DataFrame(rows, columns=rs.fields)
+        df.rename(columns={"date": "trade_date"}, inplace=True)
+        for col in ["open", "high", "low", "close", "volume", "amount"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["close"])
+        df = df[df["volume"] > 0]
+
+        if len(df) < 120:
+            continue
+
+        pure_code = bs_code.split(".")[1]
+        results[pure_code] = df.reset_index(drop=True)
+
+    bs.logout()
+    return results
+
+
+def fetch_all_stock_data(days: int = 150) -> tuple[dict, dict]:
+    """用 baostock 多进程并发拉取所有主板股票近 N 天日线数据。
+
+    开 4 个进程并发拉取，总时间从 ~67 分钟降到 ~17 分钟。
 
     Returns:
         all_data: {code: DataFrame}
         names:    {code: name}
     """
     import baostock as bs
+    from multiprocessing import Pool
 
     lg = bs.login()
     if lg.error_code != "0":
@@ -94,48 +139,25 @@ def fetch_all_stock_data(days: int = 150) -> tuple[dict, dict]:
 
     names = dict(zip(basic_df["pure_code"], basic_df["code_name"]))
     bs_codes = basic_df["code"].tolist()
+    bs.logout()
     log.info(f"待拉取股票: {len(bs_codes)} 只")
 
-    # 批量拉取日线
+    # 分成 4 批，多进程并发拉取
+    n_workers = 4
+    chunk_size = len(bs_codes) // n_workers + 1
+    batches = []
+    for i in range(n_workers):
+        chunk = bs_codes[i * chunk_size: (i + 1) * chunk_size]
+        if chunk:
+            batches.append((chunk, start_date, end_date, i))
+
+    log.info(f"启动 {len(batches)} 个并发进程拉取数据...")
     all_data = {}
-    total = len(bs_codes)
-    for i, bs_code in enumerate(bs_codes):
-        if (i + 1) % 500 == 0:
-            log.info(f"  进度: {i+1}/{total}")
+    with Pool(n_workers) as pool:
+        for batch_result in pool.imap_unordered(_fetch_batch, batches):
+            all_data.update(batch_result)
+            log.info(f"  已完成一批，累计: {len(all_data)} 只")
 
-        try:
-            rs = bs.query_history_k_data_plus(
-                bs_code,
-                "date,open,high,low,close,volume,amount,turn",
-                start_date=start_date,
-                end_date=end_date,
-                frequency="d",
-                adjustflag="2",  # 前复权
-            )
-        except Exception:
-            continue
-
-        rows = []
-        while rs.error_code == "0" and rs.next():
-            rows.append(rs.get_row_data())
-
-        if len(rows) < 120:
-            continue
-
-        df = pd.DataFrame(rows, columns=rs.fields)
-        df.rename(columns={"date": "trade_date"}, inplace=True)
-        for col in ["open", "high", "low", "close", "volume", "amount"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["close"])
-        df = df[df["volume"] > 0]
-
-        if len(df) < 120:
-            continue
-
-        pure_code = bs_code.split(".")[1]
-        all_data[pure_code] = df.reset_index(drop=True)
-
-    bs.logout()
     log.info(f"成功加载 {len(all_data)} 只股票数据")
     return all_data, names
 
