@@ -1,0 +1,35 @@
+name: B1动态策略选股
+
+on:
+  schedule:
+    # 周一至周五 UTC 10:30 = 北京时间 18:30（比现有策略晚30分钟）
+    - cron: '30 10 * * 1-5'
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  b1-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+      NOTION_PAGE_ID: ${{ secrets.NOTION_PAGE_ID }}
+      SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+      PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: cloud_requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r cloud_requirements.txt
+
+      - name: Run B1 strategy analysis
+        run: python cloud_b1_run.py --force

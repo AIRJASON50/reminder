@@ -385,3 +385,96 @@ def screen_kdj_j_low_with_yang_volume(
 
     print()  # 换行
     return results
+
+
+# ========== B1 动态策略 ==========
+
+def calc_b1_signals(df: pd.DataFrame) -> pd.DataFrame:
+    """B1 动态信号计算
+
+    流程: KDJ J 值 → MIDJ 三重均值 (28/57/114) → LP 动态阈值 → BB1 信号
+
+    Args:
+        df: 必须包含 high, low, close 列，按日期升序排列，至少 200 行
+
+    Returns:
+        添加了 J, MIDJ, LP, BB1 列的 DataFrame
+    """
+    df = calc_kdj(df)
+
+    # MIDJ: J 值的三重均值 (28 → 57 → 114)
+    df["MIDJ_28"] = df["J"].rolling(28, min_periods=14).mean()
+    df["MIDJ_57"] = df["MIDJ_28"].rolling(57, min_periods=28).mean()
+    df["MIDJ"] = df["MIDJ_57"].rolling(114, min_periods=57).mean()
+
+    # LP: 动态阈值 = MIDJ - 1.5 * std(J, 28)
+    j_std = df["J"].rolling(28, min_periods=14).std()
+    df["LP"] = df["MIDJ"] - 1.5 * j_std
+
+    # BB1: J 下穿 LP 时发出信号 (前一天 J >= LP, 当天 J < LP)
+    df["BB1"] = (df["J"].shift(1) >= df["LP"].shift(1)) & (df["J"] < df["LP"])
+
+    return df
+
+
+def check_ma_bullish_alignment(df: pd.DataFrame) -> bool:
+    """MA 多头排列判定: MA21 > MA55 > MA144
+
+    Args:
+        df: 必须包含 close 列，至少 144 行
+
+    Returns:
+        True 表示当前处于多头排列
+    """
+    if len(df) < 144:
+        return False
+
+    ma21 = df["close"].rolling(21).mean().iloc[-1]
+    ma55 = df["close"].rolling(55).mean().iloc[-1]
+    ma144 = df["close"].rolling(144).mean().iloc[-1]
+
+    if pd.isna(ma21) or pd.isna(ma55) or pd.isna(ma144):
+        return False
+
+    return ma21 > ma55 > ma144
+
+
+def check_b1_winrate(df: pd.DataFrame, lookback: int = 96,
+                     forward: int = 7) -> dict:
+    """历史胜率回测: 统计过去 lookback 天内 BB1 信号的盈利概率
+
+    用 shift(-forward) 获取信号后 forward 天的收盘价，计算收益率。
+    胜率 = 盈利次数 / 信号总数, 波动 = 收益率标准差。
+
+    Args:
+        df: 已经计算过 calc_b1_signals 的 DataFrame
+        lookback: 回测窗口天数
+        forward: 持仓天数
+
+    Returns:
+        {"winrate": float, "volatility": float, "count": int}
+    """
+    if "BB1" not in df.columns:
+        df = calc_b1_signals(df)
+
+    # 取回测窗口 (需要预留 forward 天给未来收益)
+    if len(df) < lookback + forward:
+        return {"winrate": 0.0, "volatility": 99.0, "count": 0}
+
+    backtest = df.iloc[-(lookback + forward):-forward].copy()
+    backtest["future_close"] = df["close"].shift(-forward).iloc[-(lookback + forward):-forward]
+    backtest["future_ret"] = (backtest["future_close"] - backtest["close"]) / backtest["close"]
+
+    signals = backtest[backtest["BB1"] == True]
+    if len(signals) == 0:
+        return {"winrate": 0.0, "volatility": 99.0, "count": 0}
+
+    wins = (signals["future_ret"] > 0).sum()
+    winrate = wins / len(signals) * 100
+    volatility = signals["future_ret"].std() * 100
+
+    return {
+        "winrate": round(winrate, 1),
+        "volatility": round(volatility, 1),
+        "count": len(signals),
+    }
