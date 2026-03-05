@@ -57,7 +57,7 @@ def is_trade_day(date: datetime = None) -> bool:
 
 
 # ===========================================================================
-# 2. 数据拉取 — BaoStock 多进程并发，包含创业板/科创板
+# 2. 数据拉取 — BaoStock 多进程并发，沪深主板
 # ===========================================================================
 def _fetch_batch(args):
     """子进程：独立登录 baostock，拉取一批股票数据。"""
@@ -180,37 +180,80 @@ def fetch_all_stock_data_b1(days: int = 500) -> tuple[dict, dict]:
 
 
 # ===========================================================================
-# 3. 流通市值获取
+# 3. 流通市值获取 — 用 baostock 流通股本 × 收盘价
 # ===========================================================================
-def fetch_market_cap() -> dict:
-    """用 akshare 获取全 A 股流通市值（单位：亿元）。
+def fetch_market_cap(all_data: dict) -> dict:
+    """用 baostock query_profit_data 获取流通股本，乘以最新收盘价算流通市值。
 
-    akshare stock_zh_a_spot_em() 返回流通市值单位为元，除以 1e8 转为亿元。
+    akshare stock_zh_a_spot_em() 在海外 IP (GitHub Actions) 被东财拒绝连接，
+    改用 baostock 获取季报流通股本 (liqaShare)，单位：万股。
+    流通市值(亿) = liqaShare(万股) * close(元) / 10000
+
     失败时返回空字典，选股逻辑会跳过市值过滤而非整体失败。
     """
+    import baostock as bs
+
     try:
-        import akshare as ak
-        log.info("获取流通市值数据...")
-        spot = ak.stock_zh_a_spot_em()
-        # 确认列名存在
-        cap_col = None
-        for col_name in ["流通市值", "circulating_market_cap"]:
-            if col_name in spot.columns:
-                cap_col = col_name
-                break
-        if cap_col is None:
-            log.warning(f"未找到流通市值列, 可用列: {list(spot.columns)}")
+        lg = bs.login()
+        if lg.error_code != "0":
+            log.warning(f"baostock login failed for market cap: {lg.error_msg}")
             return {}
 
+        # 取最近一个季度的报告期
+        now = datetime.now()
+        year = now.year
+        month = now.month
+        if month >= 10:
+            quarter = 3
+        elif month >= 7:
+            quarter = 2
+        elif month >= 4:
+            quarter = 1
+        else:
+            year -= 1
+            quarter = 4
+
         cap_map = {}
-        for _, row in spot.iterrows():
-            code = str(row.get("代码", row.get("code", "")))
-            cap = row.get(cap_col, None)
-            if code and cap is not None and not pd.isna(cap):
-                # akshare 返回单位为元, 转为亿元
-                cap_yi = float(cap) / 1e8
-                cap_map[code] = cap_yi
-        log.info(f"获取流通市值: {len(cap_map)} 只")
+        total = len(all_data)
+        fetched = 0
+        for idx, (code, df) in enumerate(all_data.items()):
+            if (idx + 1) % 500 == 0:
+                log.info(f"  流通市值进度: {idx+1}/{total}, 已获取: {fetched}")
+
+            # baostock 格式: sh.600000 / sz.000001
+            prefix = "sh" if code.startswith("6") else "sz"
+            bs_code = f"{prefix}.{code}"
+
+            # 尝试最近几个季度
+            found = False
+            for q_offset in range(4):
+                q = quarter - q_offset
+                y = year
+                while q <= 0:
+                    q += 4
+                    y -= 1
+                try:
+                    rs = bs.query_profit_data(code=bs_code, year=y, quarter=q)
+                    rows = []
+                    while rs.error_code == "0" and rs.next():
+                        rows.append(rs.get_row_data())
+                    if rows:
+                        profit_df = pd.DataFrame(rows, columns=rs.fields)
+                        liq_str = profit_df["liqaShare"].iloc[-1]
+                        if liq_str and liq_str != "":
+                            liq_shares = float(liq_str)  # 万股
+                            close_price = df["close"].iloc[-1]
+                            # 流通市值(亿) = 万股 * 元 / 10000
+                            cap_yi = liq_shares * close_price / 10000
+                            cap_map[code] = round(cap_yi, 1)
+                            fetched += 1
+                            found = True
+                            break
+                except Exception:
+                    continue
+
+        bs.logout()
+        log.info(f"获取流通市值: {fetched}/{total} 只")
         if cap_map:
             sample = list(cap_map.items())[:3]
             log.info(f"  市值样本(亿): {sample}")
@@ -224,7 +267,7 @@ def fetch_market_cap() -> dict:
 # 4. 选股逻辑 — B1 动态策略
 # ===========================================================================
 def scan_b1_picks(all_data: dict, names: dict, cap_map: dict) -> list[dict]:
-    """组合4个条件：BB1信号 + 多头排列 + 胜率>50%且波动<10 + 流通市值≥30亿"""
+    """组合4个条件：BB1信号 + 多头排列 + 胜率>50%且ERR<10 + 流通市值≥30亿"""
     results = []
     total = len(all_data)
     for idx, (code, df) in enumerate(all_data.items()):
@@ -260,10 +303,7 @@ def scan_b1_picks(all_data: dict, names: dict, cap_map: dict) -> list[dict]:
                 "name": names.get(code, ""),
                 "close": round(last["close"], 2),
                 "J": round(last["J"], 1),
-                "LP": round(last["LP"], 1) if not pd.isna(last["LP"]) else 0,
-                "MIDJ": round(last["MIDJ"], 1) if not pd.isna(last["MIDJ"]) else 0,
                 "胜率": f"{wr['winrate']}%",
-                "ERR": f"{wr['err']}%",
                 "信号数": wr["count"],
                 "流通市值": round(cap, 1),
                 "trade_date": last["trade_date"],
@@ -283,12 +323,12 @@ def format_picks_text(picks: list[dict], date_str: str) -> tuple[str, str]:
     if not picks:
         return title, "今日无符合条件的股票。"
 
-    lines = ["| 代码 | 名称 | 收盘 | J值 | LP | 胜率 | ERR | 市值(亿) |",
-             "|------|------|------|-----|----|------|-----|----------|"]
+    lines = ["| 代码 | 名称 | 收盘 | J值 | 胜率 | 市值(亿) |",
+             "|------|------|------|-----|------|----------|"]
     for p in picks:
         lines.append(
             f"| {p['code']} | {p['name']} | {p['close']} "
-            f"| {p['J']} | {p['LP']} | {p['胜率']} | {p['ERR']} | {p['流通市值']} |"
+            f"| {p['J']} | {p['胜率']} | {p['流通市值']} |"
         )
     return title, "\n".join(lines)
 
@@ -354,9 +394,7 @@ def update_notion(picks: list[dict], date_str: str):
             [{"text": {"content": "名称"}}],
             [{"text": {"content": "收盘"}}],
             [{"text": {"content": "J"}}],
-            [{"text": {"content": "LP"}}],
             [{"text": {"content": "胜率"}}],
-            [{"text": {"content": "ERR"}}],
             [{"text": {"content": "市值(亿)"}}],
         ]}}]
         for p in picks:
@@ -365,16 +403,14 @@ def update_notion(picks: list[dict], date_str: str):
                 [{"text": {"content": p["name"]}}],
                 [{"text": {"content": str(p["close"])}}],
                 [{"text": {"content": str(p["J"])}}],
-                [{"text": {"content": str(p["LP"])}}],
                 [{"text": {"content": p["胜率"]}}],
-                [{"text": {"content": p["ERR"]}}],
                 [{"text": {"content": str(p["流通市值"])}}],
             ]}})
 
         blocks.append({
             "type": "table",
             "table": {
-                "table_width": 8,
+                "table_width": 6,
                 "has_column_header": True,
                 "has_row_header": False,
                 "children": t_rows,
@@ -415,16 +451,16 @@ def run():
     log.info("[1/4] 在线拉取股票数据（沪深主板）...")
     all_data, names = fetch_all_stock_data_b1()
 
-    # 获取流通市值
+    # 获取流通市值 (用 baostock 流通股本 × 收盘价)
     log.info("[2/4] 获取流通市值...")
-    cap_map = fetch_market_cap()
+    cap_map = fetch_market_cap(all_data)
 
     # 选股
     log.info("[3/4] 执行 B1 策略筛选...")
     picks = scan_b1_picks(all_data, names, cap_map)
     log.info(f"B1策略中标: {len(picks)} 只")
     for p in picks:
-        log.info(f"  {p['code']} {p['name']} 收盘={p['close']} J={p['J']} LP={p['LP']} 胜率={p['胜率']}")
+        log.info(f"  {p['code']} {p['name']} 收盘={p['close']} J={p['J']} 胜率={p['胜率']} 市值={p['流通市值']}亿")
 
     # 推送
     log.info("[4/4] 推送通知...")
