@@ -441,10 +441,16 @@ def check_ma_bullish_alignment(df: pd.DataFrame) -> bool:
 
 def check_b1_winrate(df: pd.DataFrame, lookback: int = 96,
                      forward: int = 7) -> dict:
-    """历史胜率回测: 统计过去 lookback 天内 BB1 信号的盈利概率
+    """历史胜率回测 — 还原通达信公式
 
-    用 shift(-forward) 获取信号后 forward 天的收盘价，计算收益率。
-    胜率 = 盈利次数 / 信号总数, 波动 = 收益率标准差。
+    RN  = HHV(REFX(C, forward), forward) / C - 1  (持仓期内最高收盘价收益)
+    CNT = 回测窗口内 BB1 信号数
+    WIN = BB1 且 RN > 0.02 的次数（涨超 2% 才算赢）
+    AVG = 赢的 RN 均值
+    ERR = sqrt( mean( (RN_win - AVG)^2 ) ) * 100  (赢单波动标准差)
+    SSR = WIN / CNT * 100
+
+    过滤: ERR < 10 且 SSR > 50
 
     Args:
         df: 已经计算过 calc_b1_signals 的 DataFrame
@@ -452,29 +458,43 @@ def check_b1_winrate(df: pd.DataFrame, lookback: int = 96,
         forward: 持仓天数
 
     Returns:
-        {"winrate": float, "volatility": float, "count": int}
+        {"winrate": float, "err": float, "count": int}
     """
     if "BB1" not in df.columns:
         df = calc_b1_signals(df)
 
-    # 取回测窗口 (需要预留 forward 天给未来收益)
     if len(df) < lookback + forward:
-        return {"winrate": 0.0, "volatility": 99.0, "count": 0}
+        return {"winrate": 0.0, "err": 99.0, "count": 0}
 
-    backtest = df.iloc[-(lookback + forward):-forward].copy()
-    backtest["future_close"] = df["close"].shift(-forward).iloc[-(lookback + forward):-forward]
-    backtest["future_ret"] = (backtest["future_close"] - backtest["close"]) / backtest["close"]
+    # 计算 RN: 未来 forward 天内最高收盘价 / 当天收盘价 - 1
+    # 用 rolling(forward).max() 配合 shift(-forward) 实现 HHV(REFX(C,N),N)
+    future_max = df["close"].shift(-1).rolling(window=forward, min_periods=1).max()
+    df = df.copy()
+    df["RN"] = future_max / df["close"] - 1
+
+    # 取回测窗口 (预留 forward 天给未来收益)
+    backtest = df.iloc[-(lookback + forward):-forward]
 
     signals = backtest[backtest["BB1"] == True]
-    if len(signals) == 0:
-        return {"winrate": 0.0, "volatility": 99.0, "count": 0}
+    cnt = len(signals)
+    if cnt == 0:
+        return {"winrate": 0.0, "err": 99.0, "count": 0}
 
-    wins = (signals["future_ret"] > 0).sum()
-    winrate = wins / len(signals) * 100
-    volatility = signals["future_ret"].std() * 100
+    # 赢: RN > 0.02 (涨幅超过 2%)
+    win_mask = signals["RN"] > 0.02
+    win_count = win_mask.sum()
+    ssr = win_count / cnt * 100
+
+    # ERR: 赢单收益的标准差
+    if win_count > 0:
+        win_rn = signals.loc[win_mask, "RN"]
+        avg_rn = win_rn.mean()
+        err = np.sqrt(((win_rn - avg_rn) ** 2).mean()) * 100
+    else:
+        err = 99.0
 
     return {
-        "winrate": round(winrate, 1),
-        "volatility": round(volatility, 1),
-        "count": len(signals),
+        "winrate": round(ssr, 1),
+        "err": round(err, 1),
+        "count": cnt,
     }

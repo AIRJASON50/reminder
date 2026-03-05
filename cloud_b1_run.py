@@ -121,10 +121,10 @@ def _fetch_batch(args):
 
 
 def fetch_all_stock_data_b1(days: int = 500) -> tuple[dict, dict]:
-    """用 baostock 多进程并发拉取主板+创业板+科创板股票近 N 天日线数据。
+    """用 baostock 多进程并发拉取沪深主板股票近 N 天日线数据。
 
     B1 策略需要 114(MIDJ) + 96(回测) + 7(持仓) ≈ 217 交易日，500 日历日足够。
-    股票池扩展：00/60/300/688 开头，排除 ST。
+    股票池：仅沪深主板 00/60 开头，排除 ST。
 
     Returns:
         all_data: {code: DataFrame}
@@ -140,17 +140,17 @@ def fetch_all_stock_data_b1(days: int = 500) -> tuple[dict, dict]:
     end_date = datetime.now().strftime("%Y-%m-%d")
     start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
 
-    log.info("获取股票列表（含创业板/科创板）...")
+    log.info("获取股票列表（沪深主板）...")
     rs_basic = bs.query_stock_basic()
     basic_rows = []
     while rs_basic.error_code == "0" and rs_basic.next():
         basic_rows.append(rs_basic.get_row_data())
     basic_df = pd.DataFrame(basic_rows, columns=rs_basic.fields)
 
-    # 过滤：上市股票、主板+创业板+科创板、排除ST
+    # 过滤：上市股票、仅沪深主板（00/60）、排除ST
     basic_df = basic_df[(basic_df["type"] == "1") & (basic_df["status"] == "1")]
     basic_df["pure_code"] = basic_df["code"].str.split(".").str[1]
-    basic_df = basic_df[basic_df["pure_code"].str.match(r"^(00|60|300|688)\d+$")]
+    basic_df = basic_df[basic_df["pure_code"].str.match(r"^(00|60)\d{4}$")]
     basic_df = basic_df[~basic_df["code_name"].str.contains("ST", case=False, na=False)]
 
     names = dict(zip(basic_df["pure_code"], basic_df["code_name"]))
@@ -185,19 +185,35 @@ def fetch_all_stock_data_b1(days: int = 500) -> tuple[dict, dict]:
 def fetch_market_cap() -> dict:
     """用 akshare 获取全 A 股流通市值（单位：亿元）。
 
+    akshare stock_zh_a_spot_em() 返回流通市值单位为元，除以 1e8 转为亿元。
     失败时返回空字典，选股逻辑会跳过市值过滤而非整体失败。
     """
     try:
         import akshare as ak
         log.info("获取流通市值数据...")
         spot = ak.stock_zh_a_spot_em()
+        # 确认列名存在
+        cap_col = None
+        for col_name in ["流通市值", "circulating_market_cap"]:
+            if col_name in spot.columns:
+                cap_col = col_name
+                break
+        if cap_col is None:
+            log.warning(f"未找到流通市值列, 可用列: {list(spot.columns)}")
+            return {}
+
         cap_map = {}
         for _, row in spot.iterrows():
-            code = str(row.get("代码", ""))
-            cap = row.get("流通市值", None)
+            code = str(row.get("代码", row.get("code", "")))
+            cap = row.get(cap_col, None)
             if code and cap is not None and not pd.isna(cap):
-                cap_map[code] = cap / 1e8  # 转为亿元
+                # akshare 返回单位为元, 转为亿元
+                cap_yi = float(cap) / 1e8
+                cap_map[code] = cap_yi
         log.info(f"获取流通市值: {len(cap_map)} 只")
+        if cap_map:
+            sample = list(cap_map.items())[:3]
+            log.info(f"  市值样本(亿): {sample}")
         return cap_map
     except Exception as e:
         log.warning(f"获取流通市值失败: {e}，将跳过市值过滤")
@@ -225,9 +241,9 @@ def scan_b1_picks(all_data: dict, names: dict, cap_map: dict) -> list[dict]:
             if not check_ma_bullish_alignment(df):
                 continue
 
-            # 条件3: 历史胜率 > 50% 且波动 < 10%
+            # 条件3: 胜率(SSR) > 50% 且误差(ERR) < 10
             wr = check_b1_winrate(df, lookback=96, forward=7)
-            if wr["count"] == 0 or wr["winrate"] <= 50 or wr["volatility"] >= 10:
+            if wr["count"] == 0 or wr["winrate"] <= 50 or wr["err"] >= 10:
                 continue
 
             # 条件4: 流通市值 ≥ 30亿（cap_map 为空时跳过此过滤）
@@ -247,7 +263,7 @@ def scan_b1_picks(all_data: dict, names: dict, cap_map: dict) -> list[dict]:
                 "LP": round(last["LP"], 1) if not pd.isna(last["LP"]) else 0,
                 "MIDJ": round(last["MIDJ"], 1) if not pd.isna(last["MIDJ"]) else 0,
                 "胜率": f"{wr['winrate']}%",
-                "波动": f"{wr['volatility']}%",
+                "ERR": f"{wr['err']}%",
                 "信号数": wr["count"],
                 "流通市值": round(cap, 1),
                 "trade_date": last["trade_date"],
@@ -267,12 +283,12 @@ def format_picks_text(picks: list[dict], date_str: str) -> tuple[str, str]:
     if not picks:
         return title, "今日无符合条件的股票。"
 
-    lines = ["| 代码 | 名称 | 收盘 | J值 | LP | 胜率 | 波动 | 市值(亿) |",
-             "|------|------|------|-----|----|------|------|----------|"]
+    lines = ["| 代码 | 名称 | 收盘 | J值 | LP | 胜率 | ERR | 市值(亿) |",
+             "|------|------|------|-----|----|------|-----|----------|"]
     for p in picks:
         lines.append(
             f"| {p['code']} | {p['name']} | {p['close']} "
-            f"| {p['J']} | {p['LP']} | {p['胜率']} | {p['波动']} | {p['流通市值']} |"
+            f"| {p['J']} | {p['LP']} | {p['胜率']} | {p['ERR']} | {p['流通市值']} |"
         )
     return title, "\n".join(lines)
 
@@ -340,7 +356,7 @@ def update_notion(picks: list[dict], date_str: str):
             [{"text": {"content": "J"}}],
             [{"text": {"content": "LP"}}],
             [{"text": {"content": "胜率"}}],
-            [{"text": {"content": "波动"}}],
+            [{"text": {"content": "ERR"}}],
             [{"text": {"content": "市值(亿)"}}],
         ]}}]
         for p in picks:
@@ -351,7 +367,7 @@ def update_notion(picks: list[dict], date_str: str):
                 [{"text": {"content": str(p["J"])}}],
                 [{"text": {"content": str(p["LP"])}}],
                 [{"text": {"content": p["胜率"]}}],
-                [{"text": {"content": p["波动"]}}],
+                [{"text": {"content": p["ERR"]}}],
                 [{"text": {"content": str(p["流通市值"])}}],
             ]}})
 
@@ -396,7 +412,7 @@ def run():
     date_str = datetime.now().strftime("%Y-%m-%d")
 
     # 拉取数据
-    log.info("[1/4] 在线拉取股票数据（含创业板/科创板）...")
+    log.info("[1/4] 在线拉取股票数据（沪深主板）...")
     all_data, names = fetch_all_stock_data_b1()
 
     # 获取流通市值
